@@ -459,13 +459,51 @@ def _download_job(
     local_job_dir: Path,
 ) -> None:
     local_job_dir.parent.mkdir(parents=True, exist_ok=True)
-    result = _sftp(
-        target,
-        [
-            f"get -r {_sftp_path(remote_job_dir)} {_sftp_path(local_job_dir.parent)}",
-        ],
+    remote_path = Path(remote_job_dir)
+    remote_parent = shlex.quote(str(remote_path.parent))
+    remote_name = shlex.quote(remote_path.name)
+    remote_tar_command = (
+        f"tar --create --gzip --file - --directory {remote_parent} -- {remote_name}"
     )
-    _raise_ssh_error(result, "job result download")
+
+    # A recursive sftp download is very slow for agent build contexts because
+    # it performs a round trip for every file.  Stream one compressed archive
+    # over the existing SSH connection instead, preserving the local job
+    # layout while avoiding the per-file protocol overhead.
+    remote_process = subprocess.Popen(
+        ["ssh", target, remote_tar_command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert remote_process.stdout is not None
+    assert remote_process.stderr is not None
+
+    extract_result = subprocess.run(
+        [
+            "tar",
+            "--extract",
+            "--gzip",
+            "--file",
+            "-",
+            "--directory",
+            str(local_job_dir.parent),
+            "--no-same-owner",
+        ],
+        stdin=remote_process.stdout,
+        check=False,
+        capture_output=True,
+    )
+    remote_stderr = remote_process.communicate()[1]
+
+    if remote_process.returncode != 0 or extract_result.returncode != 0:
+        details = (
+            extract_result.stderr or remote_stderr or b""
+        ).decode(errors="replace").strip()
+        suffix = f": {details}" if details else ""
+        raise RuntimeError(
+            "SSH job result download failed with exit code "
+            f"{extract_result.returncode or remote_process.returncode}{suffix}"
+        )
 
 
 def run_remote_job(
