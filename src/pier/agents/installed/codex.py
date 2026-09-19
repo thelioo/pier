@@ -1024,7 +1024,7 @@ class Codex(BaseInstalledAgent):
         escaped_config = shlex.quote("\n".join(lines))
         return f'echo {escaped_config} >> "$CODEX_HOME/config.toml"'
 
-    def _resolve_auth_json_path(self) -> Path | None:
+    def resolve_auth_json_path(self) -> Path | None:
         """Resolve which auth.json to inject, if any.
 
         Defaults to None (OPENAI_API_KEY auth). Opt into auth.json auth via:
@@ -1053,6 +1053,11 @@ class Codex(BaseInstalledAgent):
             return default
 
         return None
+
+    # Keep the old private name for callers that relied on it before the SSH
+    # runner needed to inspect the local Codex authentication mode.
+    def _resolve_auth_json_path(self) -> Path | None:
+        return self.resolve_auth_json_path()
 
     @with_prompt_template
     async def run(

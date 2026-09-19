@@ -162,6 +162,15 @@ def start(
             show_default=False,
         ),
     ] = None,
+    ssh_target: Annotated[
+        str | None,
+        Option(
+            "--ssh",
+            help="Run the job on an SSH worker target (for example, 100.123.102.8).",
+            rich_help_panel="Remote Execution",
+            show_default=False,
+        ),
+    ] = None,
     job_name: Annotated[
         str | None,
         Option(
@@ -767,6 +776,41 @@ def start(
         explicit_env_file_keys = {
             key for key in dotenv_values(env_file).keys() if key is not None
         }
+
+    if ssh_target is not None:
+        from pier.cli.ssh import run_remote_job
+
+        async def _run_remote_job():
+            task_configs = await Job._resolve_task_configs(config)
+            confirm_host_env_access(
+                task_configs=task_configs,
+                agents=config.agents,
+                environment=config.environment,
+                verifier=config.verifier,
+                console=console,
+                explicit_env_file_keys=explicit_env_file_keys,
+                skip_confirm=yes,
+            )
+            return run_remote_job(
+                config,
+                task_configs,
+                target=ssh_target,
+                yes=yes,
+            )
+
+        job_result = run_async(_run_remote_job())
+        console.print()
+        print_job_results_tables(job_result)
+        console.print("[bold]Job Info[/bold]")
+        console.print(
+            f"Total runtime: {_format_duration(job_result.started_at, job_result.finished_at)}"
+        )
+        console.print(
+            f"Results written to {config.jobs_dir / config.job_name / 'result.json'}"
+        )
+        console.print(f"Inspect results by running `pier view {config.jobs_dir}`")
+        console.print()
+        return
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 

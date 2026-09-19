@@ -56,6 +56,21 @@ uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 
 Trials land under `jobs/<timestamp_or_name>/<trial_id>/`. See `pier run --help`, `pier job --help`, `pier critique --help`, and `pier view --help` for everything else.
 
+### SSH worker
+
+Install the current local Pier build on an SSH worker, then run the job there
+while keeping the remote progress output in the local terminal:
+
+```bash
+pier ssh setup 100.123.102.8
+CODEX_FORCE_AUTH_JSON=1 pier run -p path/to/task -a codex -m gpt-5.5 --ssh 100.123.102.8
+```
+
+When `CODEX_FORCE_AUTH_JSON=1` is enabled, Pier uploads the local
+`~/.codex/auth.json` only for that run. It is not installed in the VPS home and
+is removed from the worker after the command finishes; `OPENAI_API_KEY` is not
+required for this mode.
+
 ## Agent runtime configuration
 
 Use `agent.model_name` for trial metadata, `agent.env` for runtime env vars, and agent-specific `kwargs` for tool config. Pier's network allowlist also reads URLs out of those configs (Codex `config_toml`, OpenCode `opencode_config`, mini-swe `config_yaml`), so any base URL you set is allowlisted without code changes.

@@ -6,6 +6,7 @@ from typer import Typer
 from pier.cli.analyze import analyze_command, check_command
 from pier.cli.critique import critique_app
 from pier.cli.jobs import jobs_app, start
+from pier.cli.ssh import ssh_app
 from pier.cli.view import view_command
 from pier.constants import PYPI_PACKAGE_NAME
 
@@ -29,6 +30,7 @@ def main(
 
 
 app.add_typer(jobs_app, name="job", help="Manage jobs.")
+app.add_typer(ssh_app, name="ssh", help="Manage SSH workers.")
 app.add_typer(critique_app, name="critique", help="Run sandboxed critiques.")
 app.command(name="check", help="Check task quality against a rubric.")(check_command)
 app.command(name="analyze", help="Analyze trial trajectories.")(analyze_command)
