@@ -1,9 +1,11 @@
 import asyncio
 import asyncio.subprocess
+import hashlib
 import os
 import re
 import shlex
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -69,6 +71,80 @@ def _sanitize_docker_compose_project_name(name: str) -> str:
     # Replace any character that is not a-z, 0-9, -, or _ with -
     name = re.sub(r"[^a-z0-9_-]", "-", name)
     return name
+
+
+def _build_context_fingerprint(context_dir: Path, *, salt: str = "") -> str:
+    """Return a path-independent fingerprint of a Docker build context.
+
+    Docker's layer cache can make a repeated ``compose build`` inexpensive, but
+    Compose still has to walk and transfer the context before BuildKit can prove
+    that. The fingerprint lets us skip that command entirely on subsequent
+    trials. File mtimes are deliberately excluded: the same source copied to a
+    new temporary task directory must produce the same image key.
+
+    This intentionally fingerprints the complete context rather than trying to
+    partially reimplement Docker's ``.dockerignore`` matcher. Including an
+    ignored file can cause an unnecessary rebuild, but never lets a changed
+    build input reuse a stale image. Git reflogs are excluded because a
+    checkout updates them with the current time without changing the worktree
+    that the image needs.
+    """
+    context_dir = context_dir.resolve()
+    digest = hashlib.sha256(
+        f"pier-docker-context-v1\0{salt}\0".encode("utf-8")
+    )
+
+    for root, directories, files in os.walk(context_dir, topdown=True, followlinks=False):
+        directories.sort()
+        files.sort()
+        relative_root = Path(root).relative_to(context_dir)
+        if relative_root == Path(".git"):
+            directories[:] = [name for name in directories if name != "logs"]
+        files = [
+            name for name in files
+            if not (relative_root == Path(".git") and name in {"ORIG_HEAD", "FETCH_HEAD"})
+        ]
+        entries = [
+            *(Path(root) / name for name in directories),
+            *(Path(root) / name for name in files),
+        ]
+        for path in entries:
+            relative_path = path.relative_to(context_dir).as_posix()
+            info = path.lstat()
+            mode = stat_module.S_IMODE(info.st_mode)
+
+            if stat_module.S_ISDIR(info.st_mode):
+                kind = b"d"
+            elif stat_module.S_ISLNK(info.st_mode):
+                kind = b"l"
+            elif stat_module.S_ISREG(info.st_mode):
+                kind = b"f"
+            else:
+                # Docker contexts normally contain only regular files,
+                # directories and symlinks. Include other entries by metadata
+                # so a change cannot silently reuse a matching image.
+                kind = b"o"
+
+            digest.update(kind)
+            digest.update(b"\0")
+            digest.update(relative_path.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            digest.update(str(mode).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(
+                str(info.st_size if kind == b"f" else 0).encode("ascii")
+            )
+            digest.update(b"\0")
+
+            if kind == b"l":
+                digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+            elif kind == b"f":
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            digest.update(b"\0")
+
+    return digest.hexdigest()[:16]
 
 
 class DockerEnvironmentEnvVars(BaseModel):
@@ -208,10 +284,11 @@ class DockerEnvironment(BaseEnvironment):
             if self.agent_install_spec
             else ""
         )
+        self._base_main_image_name = _sanitize_docker_image_name(
+            f"hb__{environment_name}{install_fingerprint}"
+        )
         self._env_vars = DockerEnvironmentEnvVars(
-            main_image_name=_sanitize_docker_image_name(
-                f"hb__{environment_name}{install_fingerprint}"
-            ),
+            main_image_name=self._base_main_image_name,
             context_dir=str(self.environment_dir.resolve().absolute()),
             host_verifier_logs_path=trial_paths.verifier_dir.resolve()
             .absolute()
@@ -226,6 +303,7 @@ class DockerEnvironment(BaseEnvironment):
             prebuilt_image_name=task_env_config.docker_image,
         )
         self._use_prebuilt = False
+        self._image_cache_enabled = False
 
         self._compose_task_env: dict[str, str] = {}
         if task_env_config.env and self._uses_compose:
@@ -469,6 +547,64 @@ class DockerEnvironment(BaseEnvironment):
             command.append("--no-cache")
         return command
 
+    @staticmethod
+    def _cached_image_name(base_name: str, context_fingerprint: str) -> str:
+        suffix = f"__ctx-{context_fingerprint}"
+        # Keep the generated reference within Docker's repository-name limit
+        # even for unusually long task names.
+        prefix = base_name[: max(1, 255 - len(suffix))]
+        return f"{prefix}{suffix}"
+
+    @staticmethod
+    def _image_exists(image_name: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["docker", "image", "inspect", image_name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    @staticmethod
+    def _should_build(
+        *,
+        force_build: bool,
+        cache_enabled: bool,
+        image_exists: bool,
+    ) -> bool:
+        return force_build or not cache_enabled or not image_exists
+
+    def _set_cached_image_name(self) -> bool:
+        """Set the stable image name for a standard Dockerfile context.
+
+        Custom Compose tasks may define additional build contexts/services, so
+        their complete build graph cannot be represented by this one context
+        fingerprint. They retain the existing explicit-build behavior.
+        """
+        if self._uses_compose:
+            return False
+
+        try:
+            context_fingerprint = _build_context_fingerprint(
+                Path(self._env_vars.context_dir),
+                salt=f"os={self.task_env_config.os.value}",
+            )
+        except OSError as exc:
+            self.logger.warning(
+                f"Could not fingerprint Docker context; rebuilding without image reuse: {exc}"
+            )
+            return False
+
+        self._env_vars.main_image_name = self._cached_image_name(
+            self._base_main_image_name,
+            context_fingerprint,
+        )
+        return True
+
     async def _run_docker_compose_command(
         self, command: list[str], check: bool = True, timeout_sec: int | None = None
     ) -> ExecResult:
@@ -623,6 +759,9 @@ class DockerEnvironment(BaseEnvironment):
             and self.task_env_config.docker_image
             and self.agent_install_spec is None
         )
+        self._image_cache_enabled = (
+            not self._use_prebuilt and self._set_cached_image_name()
+        )
 
         # Fail fast if the daemon mode disagrees with the task's declared OS.
         self._validate_daemon_mode()
@@ -634,9 +773,19 @@ class DockerEnvironment(BaseEnvironment):
                 self.environment_name, asyncio.Lock()
             )
             async with lock:
-                await self._run_docker_compose_command(
-                    self._build_command(force_build=force_build)
+                should_build = self._should_build(
+                    force_build=force_build,
+                    cache_enabled=self._image_cache_enabled,
+                    image_exists=self._image_exists(self._env_vars.main_image_name),
                 )
+                if should_build:
+                    await self._run_docker_compose_command(
+                        self._build_command(force_build=force_build)
+                    )
+                else:
+                    self.logger.info(
+                        f"Reusing cached Docker image {self._env_vars.main_image_name}"
+                    )
 
         # Validate image OS after build/pull but before container start.
         image_to_check = (

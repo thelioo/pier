@@ -1,6 +1,9 @@
 services:
   main:
+    image: ${MAIN_IMAGE_NAME}
     build:
       context: ${CONTEXT_DIR}
-    pull_policy: build
+    # Pier decides whether the image needs a build. Compose must not trigger a
+    # second build during `up` after Pier has reused or built the image.
+    pull_policy: never
     command: [ "sh", "-c", "sleep infinity" ]
