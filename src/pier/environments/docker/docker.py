@@ -39,6 +39,8 @@ from pier.models.trial.config import ResourceMode, ServiceVolumeConfig
 from pier.models.trial.paths import EnvironmentPaths, TrialPaths
 from pier.utils.env import resolve_env_vars
 
+_ADDRESS_POOL_EXHAUSTED_MARKER = "all predefined address pools have been fully subnetted"
+
 
 def _sanitize_docker_image_name(name: str) -> str:
     """
@@ -805,7 +807,23 @@ class DockerEnvironment(BaseEnvironment):
         except RuntimeError:
             pass
 
-        await self._run_docker_compose_command(["up", "--detach", "--wait"])
+        try:
+            await self._run_docker_compose_command(["up", "--detach", "--wait"])
+        except RuntimeError as exc:
+            if _ADDRESS_POOL_EXHAUSTED_MARKER not in str(exc):
+                raise
+            # On a shared Docker daemon, other jobs' networks can outlive
+            # their containers (a killed process skips `stop()`) and hold
+            # the daemon's predefined subnets until nothing is left to
+            # allocate. `docker network prune` only removes networks with
+            # no attached container, so it cannot disturb another job's
+            # live environment; retry once after reclaiming that space.
+            self.logger.warning(
+                "Docker has no free network subnet; pruning unused networks "
+                "and retrying once."
+            )
+            await self._prune_unused_networks()
+            await self._run_docker_compose_command(["up", "--detach", "--wait"])
 
         # Make log directories world-writable so non-root agent/verifier
         # users can write to them.  (No-op for Windows containers which do
@@ -814,6 +832,23 @@ class DockerEnvironment(BaseEnvironment):
             await self.exec(
                 f"chmod 777 {self._env_paths.agent_dir} {self._env_paths.verifier_dir}"
             )
+
+    async def _prune_unused_networks(self) -> None:
+        """Reclaim Docker networks that have no container attached.
+
+        Docker only allows deleting a network once every container using it
+        is gone, so this is safe to run alongside other jobs on a shared
+        daemon: it can never remove a network another job is still using.
+        """
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            "network",
+            "prune",
+            "--force",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        await process.communicate()
 
     async def prepare_logs_for_host(self) -> None:
         """Chown the bind-mounted logs directory to the host user.

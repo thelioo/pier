@@ -120,3 +120,83 @@ def test_start_skips_compose_build_when_cached_image_exists(monkeypatch):
 def _record_command(commands: list[list[str]], command: list[str]):
     commands.append(command)
     return asyncio.sleep(0)
+
+
+def _base_environment() -> DockerEnvironment:
+    environment = object.__new__(DockerEnvironment)
+    environment._prepare_agent_build_context = lambda: None
+    environment._prepare_egress_proxy_compose = lambda: None
+    environment._write_resources_compose_file = lambda: None
+    environment._mounts_json = []
+    environment.agent_install_spec = None
+    environment._use_prebuilt = False
+    environment._set_cached_image_name = lambda: True
+    environment._validate_daemon_mode = lambda: None
+    environment._image_exists = lambda _image_name: True
+    environment._validate_image_os = lambda _image_name: asyncio.sleep(0)
+    environment._env_vars = SimpleNamespace(main_image_name="pier-cache")
+    environment._image_cache_enabled = False
+    environment._is_windows_container = True
+    environment.environment_name = "same-task"
+    environment.task_env_config = SimpleNamespace(docker_image=None)
+    environment.logger = logging.getLogger("test-docker-image-cache")
+    return environment
+
+
+def test_start_prunes_networks_and_retries_once_when_address_pool_is_exhausted():
+    environment = _base_environment()
+    commands: list[list[str]] = []
+    prune_calls: list[None] = []
+    up_attempts = {"count": 0}
+
+    def fake_run_command(command):
+        if command[0] == "up":
+            up_attempts["count"] += 1
+            if up_attempts["count"] == 1:
+                raise RuntimeError(
+                    "Docker compose command failed for environment same-task. "
+                    "Return code: 1. Stderr: Error response from daemon: "
+                    "all predefined address pools have been fully subnetted"
+                )
+        return _record_command(commands, command)
+
+    def fake_prune():
+        prune_calls.append(None)
+        return asyncio.sleep(0)
+
+    environment._run_docker_compose_command = fake_run_command
+    environment._prune_unused_networks = fake_prune
+
+    asyncio.run(environment.start(force_build=False))
+
+    assert prune_calls == [None]
+    assert [command[0] for command in commands] == ["down", "up"]
+    assert up_attempts["count"] == 2
+
+
+def test_start_does_not_prune_or_retry_for_unrelated_compose_failures():
+    environment = _base_environment()
+    prune_calls: list[None] = []
+
+    def fake_run_command(command):
+        if command[0] == "up":
+            raise RuntimeError(
+                "Docker compose command failed for environment same-task. "
+                "Return code: 1. Stderr: some unrelated failure"
+            )
+        return asyncio.sleep(0)
+
+    def fake_prune():
+        prune_calls.append(None)
+        return asyncio.sleep(0)
+
+    environment._run_docker_compose_command = fake_run_command
+    environment._prune_unused_networks = fake_prune
+
+    try:
+        asyncio.run(environment.start(force_build=False))
+        raise AssertionError("expected the unrelated RuntimeError to propagate")
+    except RuntimeError as exc:
+        assert "some unrelated failure" in str(exc)
+
+    assert prune_calls == []
