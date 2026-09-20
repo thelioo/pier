@@ -453,7 +453,10 @@ class DockerEnvironment(BaseEnvironment):
         if self.task_env_config.docker_image:
             build_dir.mkdir(parents=True, exist_ok=True)
         else:
-            shutil.copytree(self.environment_dir, build_dir)
+            # Preserve symlinks instead of dereferencing them: a task
+            # environment may contain relative symlinks (e.g. AGENTS.md ->
+            # CLAUDE.md) whose targets live alongside them in the same tree.
+            shutil.copytree(self.environment_dir, build_dir, symlinks=True)
 
         write_agent_dockerfile(
             build_dir=build_dir,
